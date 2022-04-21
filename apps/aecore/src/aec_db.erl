@@ -12,6 +12,7 @@
          initialize_db/1,               % assumes mnesia started
          load_database/0,               % called in aecore app start phase
          tables/1,                      % for e.g. test database setup
+         gced_tables/0,                 % [{PrimaryTable, SecondaryTable}]
          clear_db/0,                    % mostly for test purposes
          tab_copies/1,                  % for create_tables hooks
          check_table/3,                 % for check_tables hooks
@@ -78,7 +79,10 @@
 
 
 %% MP trees backend
--export([ find_accounts_node/1
+-export([ new_tree_context/2
+        , get_tree_node/2
+        , put_tree_node/3
+        , find_accounts_node/1
         , find_calls_node/1
         , find_channels_node/1
         , find_contracts_node/1
@@ -104,6 +108,8 @@
         , write_oracles_node/2
         , write_oracles_cache_node/2
         ]).
+
+-export([ gced_tables/0 ]).
 
 -export([ find_block_state/1
         , find_block_state/2
@@ -167,11 +173,25 @@
 -define(TAB(Record, Extra),
         {Record, tab(Mode, Record, record_info(fields, Record), Extra)}).
 
+-define(GCTAB(Tab1, Tab2), [{Tab1, Mode, Tab1, record_info(fields, Tab1)},
+                            {Tab2, Mode, Tab1, record_info(fields, Tab1)}])
+
 %% start a transaction if there isn't already one
 -define(t(Expr), ensure_transaction(fun() -> Expr end)).
 
 -define(TX_IN_MEMPOOL, []).
 -define(PERSIST, true).
+
+-record(tree, { table              :: atom()
+              , backend = mnesia   :: atom()
+              , mode = transaction :: dirty | transaction
+            }).
+
+-record(tree_gc, { primary            :: atom()
+                 , secondary          :: atom()
+                 , backend = mnesia   :: atom()
+                 , mode = transaction :: atom()
+                }).
 
 tables(Mode0) ->
     Mode = expand_mode(Mode0),
@@ -180,25 +200,42 @@ tables(Mode0) ->
     Ts.
 
 tables_(Mode) ->
-    [?TAB(aec_blocks)
-   , ?TAB(aec_headers, [{index, [height]}])
-   , ?TAB(aec_chain_state)
-   , ?TAB(aec_contract_state)
-   , ?TAB(aec_call_state)
-   , ?TAB(aec_block_state)
-   , ?TAB(aec_oracle_cache)
-   , ?TAB(aec_oracle_state)
-   , ?TAB(aec_account_state)
-   , ?TAB(aec_channel_state)
-   , ?TAB(aec_name_service_cache)
-   , ?TAB(aec_name_service_state)
-   , ?TAB(aec_signed_tx)
-   , ?TAB(aec_tx_location)
-   , ?TAB(aec_tx_pool)
-   , ?TAB(aec_discovered_pof)
-   , ?TAB(aec_signal_count)
-   , ?TAB(aec_peers)
-    ].
+    add_gc_extra_tabs(
+        [ ?TAB(aec_blocks)
+        , ?TAB(aec_headers, [{index, [height]}])
+        , ?TAB(aec_chain_state)
+        , ?TAB(aec_contract_state)
+        , ?TAB(aec_call_state)
+        , ?TAB(aec_block_state)
+        , ?TAB(aec_oracle_cache)
+        , ?TAB(aec_oracle_state)
+        , ?TAB(aec_account_state)
+        , ?TAB(aec_channel_state)
+        , ?TAB(aec_name_service_cache)
+        , ?TAB(aec_name_service_state)
+        , ?TAB(aec_signed_tx)
+        , ?TAB(aec_tx_location)
+        , ?TAB(aec_tx_pool)
+        , ?TAB(aec_discovered_pof)
+        , ?TAB(aec_signal_count)
+        , ?TAB(aec_peers)
+    ]).
+
+add_gc_extra_tabs(Tabs) ->
+    lists:foldr(fun maybe_add_gc_tab/2, [], Tabs).
+
+maybe_add_gc_tab({T, Spec}, Acc) ->
+    case lists:keyfind(T, 1, gced_tables()) of
+        {_, T2} -> [{T, note_2nd_tab(T2, Spec)}, {T2, note_2nd_tab(T, Spec)} | Acc];
+        false   -> Acc
+    end.
+
+gced_tables() ->
+    [{aec_account_state, aec_account_state_1}].
+
+note_other_tab(T, Props) ->
+    UPs = proplists:get_value(user_properties, Props, []),
+    lists:keystore(user_properties, 1, Props, [{aec_db_gc_other_tab, T}|UPs]).
 
 migrate_tables() -> migrate_tables(all).
 
@@ -772,6 +809,7 @@ get_finalized_height() ->
 dirty_get_finalized_height() ->
     dirty_get_chain_state_value(finalized_height).
 
+
 get_block_state(Hash) ->
     get_block_state(Hash, false).
 
@@ -855,6 +893,52 @@ find_block_state_and_data(Hash, DirtyBackend) ->
                           fork_id = FId, fees = Fees,
                           fraud = Fraud}] ->
             {value, aec_trees:deserialize_from_db(Trees, DirtyBackend), D, FId, Fees, Fraud};
+        [] -> none
+    end.
+
+new_tree_context(Mode, Tab) when Mode == dirty;
+                                 Mode == transaction ->
+    Backend = get_backend_module(),
+    ActivityType = case Mode of
+                            dirty -> async_dirty;
+                            transaction -> transaction
+                    end,
+    case gc_enabled(Tab) of
+        {true, {Primary, Secondary}}} ->
+            #tree_gc{ primary   = Primary
+                    , secondary = Secondary
+                    , record    = Tab
+                    , backend   = Backend
+                    , mode      = ActivityType };
+        false ->
+            #tree{ table   = Tab
+                 , backend = Backend
+                 , mode    = Mode }
+    end.
+
+find_tree_node(Hash, #tree{table = T, mode = ActivityType}) ->
+    ensure_activity(ActivityType,
+                    fun() ->
+                        find_tree_node_(Hash, T, T)
+                    end);
+find_tree_node(Hash, #tree_gc{primary = Prim,
+                              secondary = Sec,
+                              record = Rec,
+                              mode = ActivityType}) ->
+    ensure_activity(ActivityType,
+                    fun() ->
+                        case find_tree_node_(Hash, Prim, Rec)) of
+                            {value, _} = Res ->
+                                Res;
+                            none ->
+                                find_tree_node_(Hash, Sec, Rec)
+                        end
+                    end).
+
+
+find_tree_node_(Hash, T, Rec) ->
+    case read(T, Hash) of
+        [Obj] -> {value, get_tree_value(Rec, Obj)};
         [] -> none
     end.
 
@@ -953,6 +1037,11 @@ dirty_find_accounts_node(Hash) ->
         [#aec_account_state{value = Node}] -> {value, Node};
         [] -> none
     end.
+
+read_tree_node(Hash, #{context := transaction, handle := Handle}) ->
+
+read_tree_node(Hash, #{context := Ctxt, handle := Handle}) ->
+    get_backend_module()
 
 get_chain_state_value(Key) ->
     ?t(case read(aec_chain_state, Key) of
