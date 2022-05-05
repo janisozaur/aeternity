@@ -80,8 +80,8 @@
 
 %% MP trees backend
 -export([ new_tree_context/2
-        , get_tree_node/2
-        , put_tree_node/3
+        , lookup_tree_node/2
+        , enter_tree_node/3
         , find_accounts_node/1
         , find_calls_node/1
         , find_channels_node/1
@@ -108,8 +108,6 @@
         , write_oracles_node/2
         , write_oracles_cache_node/2
         ]).
-
--export([ gced_tables/0 ]).
 
 -export([ find_block_state/1
         , find_block_state/2
@@ -174,7 +172,7 @@
         {Record, tab(Mode, Record, record_info(fields, Record), Extra)}).
 
 -define(GCTAB(Tab1, Tab2), [{Tab1, Mode, Tab1, record_info(fields, Tab1)},
-                            {Tab2, Mode, Tab1, record_info(fields, Tab1)}])
+                            {Tab2, Mode, Tab1, record_info(fields, Tab1)}]).
 
 %% start a transaction if there isn't already one
 -define(t(Expr), ensure_transaction(fun() -> Expr end)).
@@ -183,15 +181,17 @@
 -define(PERSIST, true).
 
 -record(tree, { table              :: atom()
-              , backend = mnesia   :: atom()
               , mode = transaction :: dirty | transaction
             }).
 
 -record(tree_gc, { primary            :: atom()
                  , secondary          :: atom()
-                 , backend = mnesia   :: atom()
+                 , record             :: atom()
                  , mode = transaction :: atom()
                 }).
+-type tree_context() :: #tree{} | #tree_gc{}.
+-type value() :: aeu_mp_trees:value().
+-type hash() :: aeu_mp_trees:key().
 
 tables(Mode0) ->
     Mode = expand_mode(Mode0),
@@ -226,9 +226,12 @@ add_gc_extra_tabs(Tabs) ->
 
 maybe_add_gc_tab({T, Spec}, Acc) ->
     case lists:keyfind(T, 1, gced_tables()) of
-        {_, T2} -> [{T, note_2nd_tab(T2, Spec)}, {T2, note_2nd_tab(T, Spec)} | Acc];
+        {_, T2} -> [{T, note_other_tab(T2, Spec)}, {T2, note_other_tab(T, Spec)} | Acc];
         false   -> Acc
     end.
+
+gc_enabled(Tab) ->
+    lists:keymember(Tab, 1, gced_tables).
 
 gced_tables() ->
     [{aec_account_state, aec_account_state_1}].
@@ -898,49 +901,80 @@ find_block_state_and_data(Hash, DirtyBackend) ->
 
 new_tree_context(Mode, Tab) when Mode == dirty;
                                  Mode == transaction ->
-    Backend = get_backend_module(),
     ActivityType = case Mode of
                             dirty -> async_dirty;
                             transaction -> transaction
                     end,
     case gc_enabled(Tab) of
-        {true, {Primary, Secondary}}} ->
+        {true, {Primary, Secondary}} ->
             #tree_gc{ primary   = Primary
                     , secondary = Secondary
                     , record    = Tab
-                    , backend   = Backend
                     , mode      = ActivityType };
         false ->
             #tree{ table   = Tab
-                 , backend = Backend
                  , mode    = Mode }
     end.
 
-find_tree_node(Hash, #tree{table = T, mode = ActivityType}) ->
+%% Behaves like gb_trees:lookup(Key, Tree).
+-spec lookup_tree_node(hash(), tree_context()) -> none | {value, value()}.
+lookup_tree_node(Hash, #tree{table = T, mode = ActivityType}) ->
     ensure_activity(ActivityType,
                     fun() ->
-                        find_tree_node_(Hash, T, T)
+                        lookup_tree_node_(Hash, T, T)
                     end);
-find_tree_node(Hash, #tree_gc{primary = Prim,
+lookup_tree_node(Hash, #tree_gc{primary = Prim,
                               secondary = Sec,
                               record = Rec,
                               mode = ActivityType}) ->
     ensure_activity(ActivityType,
                     fun() ->
-                        case find_tree_node_(Hash, Prim, Rec)) of
+                        case lookup_tree_node_(Hash, Prim, Rec) of
                             {value, _} = Res ->
                                 Res;
                             none ->
-                                find_tree_node_(Hash, Sec, Rec)
+                                lookup_tree_node_(Hash, Sec, Rec)
                         end
                     end).
 
-
-find_tree_node_(Hash, T, Rec) ->
+lookup_tree_node_(Hash, T, Rec) ->
     case read(T, Hash) of
         [Obj] -> {value, get_tree_value(Rec, Obj)};
         [] -> none
     end.
+
+get_tree_value(Rec, {Rec, _, Value}) ->
+    Value.
+
+%% Behaves similarly gb_trees:enter(Key, Value, Tree) (but different return value)
+-spec enter_tree_node(hash(), Value, tree_context()) -> ok
+                        when Value :: any().
+enter_tree_node(Hash, Value, #tree{table = T, mode = ActivityType}) ->
+    ensure_activity(ActivityType,
+                    fun() ->
+                        enter_tree_node_(Hash, Value, T, T)
+                    end);
+enter_tree_node(Hash, Value, #tree_gc{ primary   = Prim
+                                     , record    = Rec
+                                     , mode      = ActivityType}) ->
+    ensure_activity(ActivityType,
+                    fun() ->
+                        enter_tree_node_(Hash, Value, Prim, Rec)
+                    end).
+
+enter_tree_node_(Hash, Value, Tab, Rec) ->
+    Obj = mk_record(Rec, Hash, Value),
+    ?t(write(Obj)).
+
+mk_record(aec_account_state     , K, V) -> #aec_account_state{key = K, value = V};
+mk_record(aec_call_state        , K, V) -> #aec_call_state{key = K, value = V};
+mk_record(aec_channel_state     , K, V) -> #aec_channel_state{key = K, value = V};
+mk_record(aec_contract_state    , K, V) -> #aec_contract_state{key = K, value = V};
+mk_record(aec_name_service_state, K, V) -> #aec_name_service_state{key = K, value = V};
+mk_record(aec_name_service_cache, K, V) -> #aec_name_service_cache{key = K, value = V};
+mk_record(aec_oracle_state      , K, V) -> #aec_oracle_state{key = K, value = V};
+mk_record(aec_oracle_cache      , K, V) -> #aec_oracle_cache{key = K, value = V};
+mk_record(aec_account_state     , K, V) -> #aec_account_state{key = K, value = V}.
 
 find_oracles_node(Hash) ->
     case ?t(read(aec_oracle_state, Hash)) of
@@ -1037,11 +1071,6 @@ dirty_find_accounts_node(Hash) ->
         [#aec_account_state{value = Node}] -> {value, Node};
         [] -> none
     end.
-
-read_tree_node(Hash, #{context := transaction, handle := Handle}) ->
-
-read_tree_node(Hash, #{context := Ctxt, handle := Handle}) ->
-    get_backend_module()
 
 get_chain_state_value(Key) ->
     ?t(case read(aec_chain_state, Key) of

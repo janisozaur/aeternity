@@ -15,14 +15,14 @@
         , ns_cache_backend/0
         , oracles_backend/0
         , oracles_cache_backend/0
-        , {dirty, accounts}_backend/0
-        , {dirty, calls}_backend/0
-        , {dirty, channels}_backend/0
-        , {dirty, contracts}_backend/0
+        , dirty_accounts_backend/0
+        , dirty_calls_backend/0
+        , dirty_channels_backend/0
+        , dirty_contracts_backend/0
         , dirty_ns_backend/0
-        , {dirty, ns_cache}_backend/0
-        , {dirty, oracles}_backend/0
-        , {dirty, oracles}_cache_backend/0
+        , dirty_ns_cache_backend/0
+        , dirty_oracles_backend/0
+        , dirty_oracles_cache_backend/0
         ]).
 
 -behavior(aeu_mp_trees_db).
@@ -41,7 +41,7 @@
 accounts_backend() ->
     aeu_mp_trees_db:new(db_spec(accounts)).
 
--spec {dirty, accounts}_backend() -> aeu_mp_trees_db:db().
+-spec dirty_accounts_backend() -> aeu_mp_trees_db:db().
 dirty_accounts_backend() ->
     aeu_mp_trees_db:new(db_spec({dirty, accounts})).
 
@@ -49,7 +49,7 @@ dirty_accounts_backend() ->
 calls_backend() ->
     aeu_mp_trees_db:new(db_spec(calls)).
 
--spec {dirty, calls}_backend() -> aeu_mp_trees_db:db().
+-spec dirty_calls_backend() -> aeu_mp_trees_db:db().
 dirty_calls_backend() ->
     aeu_mp_trees_db:new(db_spec({dirty, calls})).
 
@@ -57,7 +57,7 @@ dirty_calls_backend() ->
 channels_backend() ->
     aeu_mp_trees_db:new(db_spec(channels)).
 
--spec {dirty, channels}_backend() -> aeu_mp_trees_db:db().
+-spec dirty_channels_backend() -> aeu_mp_trees_db:db().
 dirty_channels_backend() ->
     aeu_mp_trees_db:new(db_spec({dirty, channels})).
 
@@ -65,7 +65,7 @@ dirty_channels_backend() ->
 contracts_backend() ->
     aeu_mp_trees_db:new(db_spec(contracts)).
 
--spec {dirty, contracts}_backend() -> aeu_mp_trees_db:db().
+-spec dirty_contracts_backend() -> aeu_mp_trees_db:db().
 dirty_contracts_backend() ->
     aeu_mp_trees_db:new(db_spec({dirty, contracts})).
 
@@ -81,7 +81,7 @@ dirty_ns_backend() ->
 ns_cache_backend() ->
     aeu_mp_trees_db:new(db_spec(ns_cache)).
 
--spec {dirty, ns_cache}_backend() -> aeu_mp_trees_db:db().
+-spec dirty_ns_cache_backend() -> aeu_mp_trees_db:db().
 dirty_ns_cache_backend() ->
     aeu_mp_trees_db:new(db_spec({dirty, ns_cache})).
 
@@ -89,7 +89,7 @@ dirty_ns_cache_backend() ->
 oracles_backend() ->
     aeu_mp_trees_db:new(db_spec(oracles)).
 
--spec {dirty, oracles}_backend() -> aeu_mp_trees_db:db().
+-spec dirty_oracles_backend() -> aeu_mp_trees_db:db().
 dirty_oracles_backend() ->
     aeu_mp_trees_db:new(db_spec({dirty, oracles})).
 
@@ -97,7 +97,7 @@ dirty_oracles_backend() ->
 oracles_cache_backend() ->
     aeu_mp_trees_db:new(db_spec(oracles_cache)).
 
--spec {dirty, oracles}_cache_backend() -> aeu_mp_trees_db:db().
+-spec dirty_oracles_cache_backend() -> aeu_mp_trees_db:db().
 dirty_oracles_cache_backend() ->
     aeu_mp_trees_db:new(db_spec({dirty, oracles_cache})).
 
@@ -123,12 +123,12 @@ tab_name(T) when is_atom(T) -> T.
 mpt_db_get(Key, {gb_trees, Tree}) ->
     gb_trees:lookup(Key, Tree);
 mpt_db_get(Key, Handle) ->
-    aec_db:get_tree_node(Key, Handle).
+    aec_db:lookup_tree_node(Key, Handle).
 
 mpt_db_put(Key, Val, {gb_trees, Tree}) ->
     {gb_trees, gb_trees:enter(Key, Val, Tree)};
 mpt_db_put(Key, Val, Handle) ->
-    ok = aec_db:put_tree_node(Key, Val, Handle),
+    ok = aec_db:enter_tree_node(Key, Val, Handle),
     Handle.
 
 mpt_db_drop_cache({gb_trees, _}) ->
