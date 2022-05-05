@@ -162,6 +162,8 @@
 %% - one per state tree
 %% - untrusted peers
 
+-define(BYPASS, {?MODULE, mnesia_bypass}).
+
 -define(TAB(Record),
         {Record, tab(Mode, Record, record_info(fields, Record), [])}).
 -define(TAB(Record, Extra),
@@ -388,13 +390,13 @@ ensure_activity(Type, Fun) when is_function(Fun, 0) ->
 %%         _ ->
 %%             mrdb_activity(Type, Fun)
 %%     end;
-ensure_activity(_Backend, transaction, Fun) when is_function(Fun, 0) ->
+ensure_activity(Backend, transaction, Fun) when is_function(Fun, 0) ->
     case get(mnesia_activity_state) of
         undefined ->
-            mnesia:activity(transaction, Fun);
+            do_transaction(Backend, Fun);
         {_, _, non_transaction} ->
             %% Transaction inside a dirty context; rely on mnesia to handle it
-            mnesia:activity(transaction, Fun);
+            do_transaction(Backend, Fun);
         _ ->
             %% We are already in a transaction.
             Fun()
@@ -406,6 +408,14 @@ ensure_activity(_Backend, PreferredType, Fun) when is_function(Fun, 0) ->
         _ ->
             Fun()
     end.
+
+do_transaction(mnesia_rocksdb, transaction, Fun) ->
+    mnesia:activity(transaction, fun() ->
+                                         Res = Fun(),
+                                         bypass_on_commit()
+                                 end);
+do_transaction(_BackendMod, Type, Fun) ->
+    mnesia:activity(Type, Fun).
 
 %% fun_info(F, K) ->
 %%     {K, V} = erlang:fun_info(F, K),
@@ -622,14 +632,37 @@ find_key_headers_and_hash_at_height(Height) when is_integer(Height), Height >= 0
             [{Hash, aec_headers:from_db_header(Header)}
              || #aec_headers{key = Hash, value = Header} <- R];
         done ->
-            R = dirty_select(aec_chain_state,
-                             [{#aec_chain_state{key = {key_header, Height, '_'},
-                                                value = '_'}
-                              , []
-                              , ['$_']}]),
-            [{Hash, aec_headers:from_db_header(Header)}
-             || #aec_chain_state{key = {key_header, _, Hash}, value = Header} <- R]
+            case mrdb_get_ref(aec_chain_state) of
+                undefined ->
+                    R = dirty_select(aec_chain_state,
+                                     [{#aec_chain_state{key = {key_header, Height, '_'},
+                                                        value = '_'}
+                                      , []
+                                      , ['$_']}]),
+                    [{Hash, aec_headers:from_db_header(Header)}
+                     || #aec_chain_state{key = {key_header, _, Hash}, value = Header} <- R];
+                Ref ->
+                    %% slight reduction of overhead if using the rocksdb backend
+                    rocks_iterate_from_to(
+                      fun({_, _, Hash}, V, Acc) ->
+                              [{Hash, aec_headers:from_db_header(element(3, binary_to_term(V)))} | Acc]
+                      end, [], Ref, {key_header, Height, '_'}, {key_header, Height+1, '_'})
+            end
     end.
+
+rocks_iterate_from_to(Fun, Acc, Ref, From, To) -> 
+    ToPfx = sext:prefix(To),
+    mrdb:with_rdb_iterator(
+      Ref, fun(I) ->
+                   rocks_iterate_from_to_loop(
+                     I, ToPfx, mrdb:rdb_iterator_move(I, sext:prefix(From)), Fun, Acc)
+           end, [{iterate_upper_bound, ToPfx}]).
+
+rocks_iterate_from_to_loop(I, ToBin, {ok, K, V}, Fun, Acc) when ToBin > K ->
+    Acc1 = Fun(sext:decode(K), binary_to_term(V), Acc),
+    rocks_iterate_from_to_loop(I, ToBin, mrdb:rdb_iterator_move(I, next), Fun, Acc1);
+rocks_iterate_from_to_loop(_, _, _, _, Acc) ->
+    Acc.
 
 find_discovered_pof(Hash) ->
     case ?t(read(aec_discovered_pof, Hash)) of
@@ -1164,6 +1197,9 @@ put_backend_module(#{module := M}) ->
 
 get_backend_module() ->
     persistent_term:get({?MODULE, backend_module}).
+
+rdb_get_ref(Tab) ->
+    mnesia_rocksdb_admin:get_ref(Tab, undefined).
 
 %% Test interface
 initialize_db(ram) ->
