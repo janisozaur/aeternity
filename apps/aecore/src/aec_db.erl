@@ -393,10 +393,10 @@ ensure_activity(Type, Fun) when is_function(Fun, 0) ->
 ensure_activity(Backend, transaction, Fun) when is_function(Fun, 0) ->
     case get(mnesia_activity_state) of
         undefined ->
-            do_transaction(Backend, Fun);
+            do_transaction(Backend, transaction, Fun);
         {_, _, non_transaction} ->
             %% Transaction inside a dirty context; rely on mnesia to handle it
-            do_transaction(Backend, Fun);
+            do_transaction(Backend, transaction, Fun);
         _ ->
             %% We are already in a transaction.
             Fun()
@@ -410,12 +410,77 @@ ensure_activity(_Backend, PreferredType, Fun) when is_function(Fun, 0) ->
     end.
 
 do_transaction(mnesia_rocksdb, transaction, Fun) ->
-    mnesia:activity(transaction, fun() ->
-                                         Res = Fun(),
-                                         bypass_on_commit()
-                                 end);
+    try mnesia:activity(transaction, fun() ->
+                                             Res = Fun(),
+                                             bypass_on_commit(Res)
+                                     end)
+    catch
+        throw:{bypass, R} ->
+            R
+    end;
 do_transaction(_BackendMod, Type, Fun) ->
     mnesia:activity(Type, Fun).
+
+bypass_on_commit(R) ->
+    case persistent_term:get(?BYPASS, no_bypass) of
+        rocksdb ->
+            {mnesia, _, {tidstore, TStore, _, _}} = get(mnesia_activity_state),
+            case mrdb:activity(
+                   batch, mnesia_rocksdb,
+                   fun() -> walk_tstore(TStore, {[], []}) end) of
+                {[], []} ->
+                    %% If there is nothing to commit
+                    %% aborting the transaction will be faster than going through commit protocols and checkpointing in mnesia
+                    throw({bypass, R});
+                {Found, NotFound} ->
+                    case NotFound of
+                        [] -> throw({bypass, R});
+                        _ ->
+                            %% When not all data was bypassed then log what was not bypassed
+                            lager:debug("Missed tables in mnesia bypass: ~p\n", [NotFound]),
+                            %% Fixup the transaction store as we have still data left to write :P
+                            lists:foreach(
+                              fun(E) -> ets:delete(TStore, E) end, Found),
+                            R
+                    end
+            end;
+        _ ->
+            R
+    end.
+
+            %% try ets:foldl(fun walk_tstore/2, #{}, TStore) of
+            %%     M when map_size(M) =:= 0 ->
+            %%         throw({bypass, R});
+            %%     M ->
+            %%         {Found, NotFound} =
+            %%             lists:foldl(
+            %%               fun({Table, Batch}, {AccFound, AccNotFound}) ->
+            %%                       case mrdb_get_ref(Table) of
+            %%                           undefined ->
+            %%                               {AccFound, [Table|AccNotFound]};
+            %%                           TRef ->
+
+walk_tstore(TStore, Ref) ->                                          
+    ets:foldl(fun walk_tstore_/2, Ref, TStore).
+
+walk_tstore_({{locks, _, _}, _}, Acc) -> Acc;
+walk_tstore_({nodes, _}, Acc) -> Acc;
+walk_tstore_({{Table, _Key}, Val, write} = E, {F, NF}) ->
+    case mrdb_get_ref(Table) of
+        undefined ->
+            {F, [E | NF]};
+        R ->
+            mrdb:insert(R, Val),
+            {[E | F], NF}
+    end;
+walk_tstore_({{Table, Key}, _, delete} = E, {F, NF}) ->
+    case mrdb_get_ref(Table) of
+        undefined ->
+            {F, [E | NF]};
+        R ->
+            mrdb:delete(R, Key),
+            {[E | F], NF}
+    end.
 
 %% fun_info(F, K) ->
 %%     {K, V} = erlang:fun_info(F, K),
@@ -1127,7 +1192,8 @@ load_database() ->
     lager:debug("tables loaded", []),
     convert_top_block_entry(),
     lager:debug("top block entry converted", []),
-    aec_db_gc:maybe_swap_nodes().
+    aec_db_gc:maybe_swap_nodes(),
+    prepare_mnesia_bypass().
 
 wait_for_tables() ->
     Tabs = mnesia:system_info(tables) -- [schema],
@@ -1152,6 +1218,18 @@ wait_for_tables(Tabs, Sofar, _, _) ->
     %% of keeping retrying, but also raise an error for the crash log.
     init:stop(),
     erlang:error({tables_not_loaded, Tabs}).
+
+%% Prepare bypass
+prepare_mnesia_bypass() ->
+    Tabs = mnesia:system_info(tables) -- [schema],
+    case [T || T <- Tabs,
+               mrdb_get_ref(T) =/= undefined] of
+        [] ->
+            %% Check whether we can bypass mnesia in some cases
+            persistent_term:erase(?BYPASS); %% TODO: add leveled backend here
+        [_|_] ->
+            persistent_term:put(?BYPASS, rocksbd)
+    end.
 
 %% Initialization routines
 
@@ -1198,7 +1276,7 @@ put_backend_module(#{module := M}) ->
 get_backend_module() ->
     persistent_term:get({?MODULE, backend_module}).
 
-rdb_get_ref(Tab) ->
+mrdb_get_ref(Tab) ->
     mnesia_rocksdb_admin:get_ref(Tab, undefined).
 
 %% Test interface
