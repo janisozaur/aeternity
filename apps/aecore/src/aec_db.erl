@@ -12,6 +12,7 @@
          initialize_db/1,               % assumes mnesia started
          load_database/0,               % called in aecore app start phase
          tables/1,                      % for e.g. test database setup
+         gced_tables/0,                 % [{PrimaryTable, SecondaryTable}]
          clear_db/0,                    % mostly for test purposes
          tab_copies/1,                  % for create_tables hooks
          check_table/3,                 % for check_tables hooks
@@ -80,6 +81,10 @@
 
 %% MP trees backend
 -export([ find_accounts_node/1
+        , new_tree_context/2
+        , lookup_tree_node/2
+        , enter_tree_node/3
+        , find_accounts_node/1
         , find_calls_node/1
         , find_channels_node/1
         , find_contracts_node/1
@@ -188,11 +193,30 @@
 -define(TAB(Record, Extra),
         {Record, tab(Mode, Record, record_info(fields, Record), Extra)}).
 
+-define(GCTAB(Tab1, Tab2), [{Tab1, Mode, Tab1, record_info(fields, Tab1)},
+                            {Tab2, Mode, Tab1, record_info(fields, Tab1)}]).
+
 %% start a transaction if there isn't already one
 -define(t(Expr), ensure_transaction(fun() -> Expr end)).
 
 -define(TX_IN_MEMPOOL, []).
 -define(PERSIST, true).
+
+-type tree_mode() :: dirty | transaction.
+
+-record(tree, { table              :: atom()
+              , mode = transaction :: tree_mode()
+              }).
+
+-record(tree_gc, { primary   :: atom()
+                 , secondary :: atom()
+                 , record    :: tree_mode()
+                 , mode = transaction :: tree_mode()
+                 }).
+-type tree_context() :: #tree{} | #tree_gc{}.
+-type value() :: aeu_mp_trees:value().
+-type hash()  :: aeu_mp_trees:key().
+                  
 
 tables(Mode0) ->
     Mode = expand_mode(Mode0),
@@ -201,25 +225,46 @@ tables(Mode0) ->
     Ts.
 
 tables_(Mode) ->
-    [?TAB(aec_blocks)
-   , ?TAB(aec_headers, [{index, [height]}])
-   , ?TAB(aec_chain_state)
-   , ?TAB(aec_contract_state)
-   , ?TAB(aec_call_state)
-   , ?TAB(aec_block_state)
-   , ?TAB(aec_oracle_cache)
-   , ?TAB(aec_oracle_state)
-   , ?TAB(aec_account_state)
-   , ?TAB(aec_channel_state)
-   , ?TAB(aec_name_service_cache)
-   , ?TAB(aec_name_service_state)
-   , ?TAB(aec_signed_tx)
-   , ?TAB(aec_tx_location)
-   , ?TAB(aec_tx_pool)
-   , ?TAB(aec_discovered_pof)
-   , ?TAB(aec_signal_count)
-   , ?TAB(aec_peers)
-    ].
+    add_gc_extra_tabs(
+      [ ?TAB(aec_blocks)
+      , ?TAB(aec_headers, [{index, [height]}])
+      , ?TAB(aec_chain_state)
+      , ?TAB(aec_contract_state)
+      , ?TAB(aec_call_state)
+      , ?TAB(aec_block_state)
+      , ?TAB(aec_oracle_cache)
+      , ?TAB(aec_oracle_state)
+      , ?TAB(aec_account_state)
+      , ?TAB(aec_channel_state)
+      , ?TAB(aec_name_service_cache)
+      , ?TAB(aec_name_service_state)
+      , ?TAB(aec_signed_tx)
+      , ?TAB(aec_tx_location)
+      , ?TAB(aec_tx_pool)
+      , ?TAB(aec_discovered_pof)
+      , ?TAB(aec_signal_count)
+      , ?TAB(aec_peers)
+      ]).
+
+add_gc_extra_tabs(Tabs) ->
+    lists:foldr(fun maybe_add_gc_tab/2, [], Tabs).
+
+maybe_add_gc_tab({T, Spec} = Tab, Acc) ->
+     case lists:keyfind(T, 1, gced_tables()) of
+         {_, T2} -> [{T, note_other_tab(T2, Spec)}, {T2, note_other_tab(T, Spec)} | Acc];
+         false   -> [Tab | Acc]
+     end.
+
+gc_enabled(Tab) ->
+    lists:keymember(Tab, 1, gced_tables()).
+
+gced_tables() ->
+    [{aec_account_state, aec_account_state_1}].
+
+note_other_tab(T, Props) ->
+    UPs = proplists:get_value(user_properties, Props, []),
+    lists:keystore(user_properties, 1, Props,
+                   {user_properties, [{aec_db_gc_other_tab, T}|UPs]}).
 
 migrate_tables() -> migrate_tables(all, undefined).
 
@@ -1007,6 +1052,7 @@ find_block_state_and_data(Hash, DirtyBackend) ->
         [] -> none
     end.
 
+
 find_oracles_node(Hash) ->
     case ?t(read(aec_oracle_state, Hash)) of
         [#aec_oracle_state{value = Node}] -> {value, Node};
@@ -1102,6 +1148,95 @@ dirty_find_accounts_node(Hash) ->
         [#aec_account_state{value = Node}] -> {value, Node};
         [] -> none
     end.
+
+new_tree_context(Mode, Tab) when Mode =:= dirty;
+                                 Mode =:= transaction ->
+    ActivityType = case Mode of
+                       dirty -> async_dirty;
+                       transaction -> transaction
+                   end,
+    case gc_enabled(Tab) of
+        {true, {Primary, Secondary}} ->
+            #tree_gc{ primary   = Primary
+                    , secondary = Secondary
+                    , record    = Tab
+                    , mode      = ActivityType };
+        false ->
+            #tree{ table = Tab
+                 , mode  = ActivityType }
+    end.
+
+%% Behaves like gb_trees:lookup(Key, Tree).
+-spec lookup_tree_node(hash(), tree_context()) -> none | {value, value()}.
+lookup_tree_node(Hash, #tree{table = T, mode = ActivityType}) ->
+    ensure_activity(ActivityType,
+                    fun() ->
+                            lookup_tree_node_(Hash, T, T)
+                    end);
+lookup_tree_node(Hash, #tree_gc{ primary   = Prim
+                               , secondary = Sec
+                               , record    = Rec
+                               , mode      = ActivityType}) ->
+    
+    ensure_activity(ActivityType,
+                    fun() ->
+                            case lookup_tree_node_(Hash, Prim, Rec) of
+                                {value, _} = Res ->
+                                    Res;
+                                none_ ->
+                                    lookup_secondary_tree_node_(Hash, Sec, Prim, Rec)
+                            end
+                    end).
+
+lookup_tree_node_(Hash, T, Rec) ->
+    case read(T, Hash) of
+        [Obj] ->
+            {value, get_tree_value(Rec, Obj)};
+        [] ->
+            none
+    end.
+
+lookup_secondary_tree_node_(Hash, Sec, Prim, Rec) ->
+    case read(Sec, Hash) of
+        [Obj] ->
+            write(Prim, Obj, write),
+            {value, get_tree_value(Rec, Obj)};
+        [] ->
+            none
+    end.
+
+get_tree_value(Rec, {Rec, _, Value}) ->
+    Value.
+
+%%  Behaves similarly to gb_trees:enter(Key, Value, Tree) (but different return value)
+-spec enter_tree_node(hash(), Value, tree_context()) -> ok
+              when Value :: any().
+enter_tree_node(Hash, Value, #tree{table = T, mode = ActivityType}) ->
+    ensure_activity(ActivityType,
+                    fun() ->
+                            enter_tree_mode_(Hash, Value, T, T)
+                    end);
+enter_tree_node(Hash, Value, #tree_gc{ primary = Prim
+                                     , record  = Rec
+                                     , mode    = ActivityType }) ->
+    ensure_activity(Activity,
+                    fun() ->
+                            enter_tree_node_(Hash, Value, Prim, Rec)
+                    end).
+
+enter_tree_mode_(Hash, Value, Tab, Rec) ->
+    Obj = mk_record(Rec, Hash, Value),
+    write(Tab, Obj, write).
+
+mk_record(aec_account_state     , K, V) -> #aec_account_state{key = K, value = V};
+mk_record(aec_call_state        , K, V) -> #aec_call_state{key = K, value = V};
+mk_record(aec_channel_state     , K, V) -> #aec_channel_state{key = K, value = V};
+mk_record(aec_contract_state    , K, V) -> #aec_contract_state{key = K, value = V};
+mk_record(aec_name_service_state, K, V) -> #aec_name_service_state{key = K, value = V};
+mk_record(aec_name_service_cache, K, V) -> #aec_name_service_cache{key = K, value = V};
+mk_record(aec_oracle_state      , K, V) -> #aec_oracle_state{key = K, value = V};
+mk_record(aec_oracle_cache      , K, V) -> #aec_oracle_cache{key = K, value = V};
+mk_record(aec_account_state     , K, V) -> #aec_account_state{key = K, value = V}.
 
 get_chain_state_value(Key) ->
     ?t(case read(aec_chain_state, Key) of
