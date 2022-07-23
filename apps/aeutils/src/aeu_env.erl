@@ -296,6 +296,23 @@ valid_kv_pair(_) ->
 
 
 read_config() ->
+    LogDir = setup:log_dir(),
+    dbg:tracer(port, dbg:trace_port(file, filename:join(LogDir, "trace.txt"))),
+    dbg:tp(mnesia,x),
+    dbg:tpl(mnesia_monitor,x),
+    dbg:tp(mnesia_lib,x),
+    dbg:tp(aec_db,x),
+    dbg:tpl(mrdb,x),
+    dbg:tp(mnesia_rocksdb,x),
+    dbg:tp(persistent_term,put,[]),
+%%    dbg:tp(mnesia_rocksdb_admin,x),
+%%    dbg:tpl(mnesia_rocksdb_admin,find_cf,x),
+    dbg:tpl(mnesia_loader,x),
+    dbg:tpl(mnesia_dumper,x),
+    dbg:tp(aec_chain,x),
+    %% dbg:tp(rocksdb,x),
+    dbg:p(all,[c,p,timestamp]),
+
     read_config(report).
 
 read_config(Mode) when Mode =:= silent; Mode =:= report ->

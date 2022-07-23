@@ -132,6 +132,7 @@ node_can_reuse_db_of_other_node_(T = #db_reuse_test_spec{}, Cfg)
        is_function(T#db_reuse_test_spec.populate, 2),
        is_function(T#db_reuse_test_spec.reuse, 2),
        is_function(T#db_reuse_test_spec.assert, 3) ->
+    ct:log("T = ~p", [T]),
     DbHostPath = node_db_host_path(node1, Cfg),
     N1 = (T#db_reuse_test_spec.create)(node1, DbHostPath),
     aest_nodes:setup_nodes([N1], Cfg),
